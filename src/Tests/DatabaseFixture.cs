@@ -1,15 +1,22 @@
+using System.Diagnostics;
+using System.Text.Json.Serialization;
 using System.Text.Json.Serialization.Metadata;
+using Blumchen;
 using Blumchen.Database;
 using Blumchen.Serialization;
 using Blumchen.Subscriptions;
 using Blumchen.Subscriptions.Management;
 using Npgsql;
 using Testcontainers.PostgreSql;
+using Xunit.Abstractions;
 
 namespace Tests;
 
-public abstract class DatabaseFixture: IAsyncLifetime
+
+public abstract class DatabaseFixture(ITestOutputHelper output): IAsyncLifetime
 {
+    protected ITestOutputHelper Output { get; } = output;
+    protected readonly Func<CancellationTokenSource> TimeoutTokenSource = () => new(Debugger.IsAttached ?  TimeSpan.FromHours(1) : TimeSpan.FromSeconds(2));
     protected class TestConsumer<T>(Action<string> log, JsonTypeInfo info): IConsumes<T> where T : class
     {
         public async Task Handle(T value)
@@ -22,7 +29,7 @@ public abstract class DatabaseFixture: IAsyncLifetime
             {
                 Console.WriteLine(e);
             }
-            await Task.CompletedTask;
+            await Task.CompletedTask.ConfigureAwait(false);
         }
     }
 
@@ -30,15 +37,9 @@ public abstract class DatabaseFixture: IAsyncLifetime
         .WithCommand("-c", "wal_level=logical")
         .Build();
 
-    public Task InitializeAsync()
-    {
-        return Container.StartAsync();
-    }
+    public Task InitializeAsync() => Container.StartAsync();
 
-    public async Task DisposeAsync()
-    {
-        await Container.DisposeAsync();
-    }
+    public async Task DisposeAsync() => await Container.DisposeAsync().ConfigureAwait(false);
 
     protected static async Task<string> CreateOutboxTable(
         NpgsqlDataSource dataSource,
@@ -47,7 +48,8 @@ public abstract class DatabaseFixture: IAsyncLifetime
     {
         var tableName = Randomise("outbox");
 
-        await dataSource.EnsureTableExists(tableName, ct);
+        var tableDesc = new TableDescriptorBuilder().Name(tableName).Build();
+        await dataSource.EnsureTableExists(tableDesc, ct).ConfigureAwait(false);
 
         return tableName;
     }
@@ -55,27 +57,50 @@ public abstract class DatabaseFixture: IAsyncLifetime
     private static string Randomise(string prefix) =>
         $"{prefix}_{Guid.NewGuid().ToString().Replace("-", "")}";
 
-    protected static (TypeResolver typeResolver, TestConsumer<T> consumer, SubscriptionOptionsBuilder subscriptionOptionsBuilder) SetupFor<T>(
+    protected static async Task InsertPoisoningMessage(string connectionString, string eventsTable, CancellationToken ct)
+    {
+        var connection = new NpgsqlConnection(connectionString);
+        await using var connection1 = connection.ConfigureAwait(false);
+        await connection.OpenAsync(ct);
+        var command = connection.CreateCommand();
+        command.CommandText = $"INSERT INTO {eventsTable}(message_type, data) values ('urn:message:user-created:v1', '{{\"prop\":\"some faking text\"}}')";
+        await command.ExecuteNonQueryAsync(ct);
+    }
+
+    protected (TestConsumer<T> consumer, SubscriptionOptionsBuilder subscriptionOptionsBuilder) SetupFor<T>(
         string connectionString,
         string eventsTable,
-        JsonTypeInfo info,
+        JsonSerializerContext info,
+        INamingPolicy namingPolicy,
         Action<string> log,
         string? publicationName = null,
         string? slotName = null) where T : class
     {
-        var typeResolver = new TypeResolver(SourceGenerationContext.Default).WhiteList<T>();
-        var consumer = new TestConsumer<T>(log, info);
+        var jsonTypeInfo = info.GetTypeInfo(typeof(T));
+        ArgumentNullException.ThrowIfNull(jsonTypeInfo);
+        var consumer = new TestConsumer<T>(log, jsonTypeInfo);
         var subscriptionOptionsBuilder = new SubscriptionOptionsBuilder()
+            .WithErrorProcessor(new TestOutErrorProcessor(Output))
             .ConnectionString(connectionString)
-            .TypeResolver(typeResolver)
+            .JsonContext(info)
+            .NamingPolicy(namingPolicy)
             .Consumes<T, TestConsumer<T>>(consumer)
+            .WithTable(o => o.Name(eventsTable))
             .WithPublicationOptions(
-                new PublicationManagement.PublicationSetupOptions(publicationName ?? Randomise("events_pub"), eventsTable)
+                new PublicationManagement.PublicationSetupOptions(PublicationName: publicationName ?? Randomise("events_pub"))
             )
             .WithReplicationOptions(
                 new ReplicationSlotManagement.ReplicationSlotSetupOptions(slotName ?? Randomise("events_slot"))
             );
-        return (typeResolver, consumer, subscriptionOptionsBuilder);
+        return (consumer, subscriptionOptionsBuilder);
     }
 
+    private sealed record TestOutErrorProcessor(ITestOutputHelper Output): IErrorProcessor
+    {
+        public Func<Exception, Task> Process => exception =>
+        {
+            Output.WriteLine($"record id:{0} resulted in error:{exception.Message}");
+            return Task.CompletedTask;
+        };
+    }
 }
